@@ -1,20 +1,51 @@
 # app.py
 # PHPAiModel-RNN — Python port of generator_weights.php
-# - Serves a minimal UI
+# - Minimal UI (Flask)
 # - Streams training logs (progress %, ETA, avg loss)
-# - Trains simple tanh-RNN with Adagrad on tokenized RU/EN text datasets
+# - Simple tanh-RNN with Adagrad on tokenized RU/EN text datasets
 # - Saves model JSON to ./Models
 #
+# GPU: CuPy (CUDA 11.x) if available, otherwise CPU (NumPy)
 # Author: ported for Artur Strazewicz project
 # License: MIT (2025)
 
-import os, re, json, time, math, threading
+import os, re, json, time, math
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict
 
-import numpy as np
+import numpy as _np  # always have NumPy around
 from flask import Flask, Response, request, render_template_string, send_from_directory, stream_with_context
+
+# --------- Backend (CuPy preflight with graceful fallback) ----------
+_GPU_AVAILABLE = False
+GPU_INIT_ERROR = ""
+try:
+    import cupy as xp  # try GPU arrays
+    try:
+        # quick preflight: matmul (hits cuBLAS) + device info
+        _ = (xp.ones((2,2), dtype=xp.float32) @ xp.ones((2,2), dtype=xp.float32)).sum()
+        import cupy as _cp
+        _CUDA_RUNTIME = None
+        _GPU_NAME = None
+        try:
+            from cupy.cuda import runtime, Device
+            _CUDA_RUNTIME = runtime.runtimeGetVersion()
+            _GPU_NAME = Device(0).attributes.get('Name') if hasattr(Device(0), 'attributes') else None
+            # fallback way to get name
+            if not _GPU_NAME:
+                _GPU_NAME = Device(0).name if hasattr(Device(0), 'name') else None
+        except Exception:
+            pass
+        _GPU_AVAILABLE = True
+    except Exception as e:
+        import numpy as xp  # fallback to CPU
+        GPU_INIT_ERROR = f"GPU disabled: CuPy preflight failed: {e}"
+        _GPU_AVAILABLE = False
+except Exception as e:
+    import numpy as xp
+    GPU_INIT_ERROR = f"GPU disabled: CuPy import failed: {e}"
+    _GPU_AVAILABLE = False
 
 # --------------- Config ---------------
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +78,16 @@ def build_vocab(tokens: List[str]) -> Tuple[Dict[str,int], List[str]]:
             id2tok.append(t)
     return tok2id, id2tok
 
+def to_cpu(a):
+    """Return NumPy array for JSON export regardless of backend."""
+    try:
+        import cupy as cp
+        if isinstance(a, cp.ndarray):
+            return cp.asnumpy(a)
+    except Exception:
+        pass
+    return _np.asarray(a)
+
 # --------------- RNN Core ---------------
 class TinyRNN:
     """
@@ -59,88 +100,81 @@ class TinyRNN:
       by:  (V,)
     """
     def __init__(self, V: int, H: int, scale: float = 0.05, seed: int = 42):
-        rng = np.random.default_rng(seed)
+        rng = _np.random.default_rng(seed)  # RNG stays NumPy for reproducibility
         self.V, self.H = V, H
-        self.Wxh = (rng.random((H, V)) * 2 - 1) * scale
-        self.Whh = (rng.random((H, H)) * 2 - 1) * scale
-        self.Why = (rng.random((V, H)) * 2 - 1) * scale
-        self.bh  = np.zeros((H,), dtype=np.float64)
-        self.by  = np.zeros((V,), dtype=np.float64)
+        # All tensors on xp backend (CuPy if GPU ok, else NumPy), float32
+        self.Wxh = xp.asarray(((rng.random((H, V)) * 2 - 1) * scale), dtype=xp.float32)
+        self.Whh = xp.asarray(((rng.random((H, H)) * 2 - 1) * scale), dtype=xp.float32)
+        self.Why = xp.asarray(((rng.random((V, H)) * 2 - 1) * scale), dtype=xp.float32)
+        self.bh  = xp.zeros((H,), dtype=xp.float32)
+        self.by  = xp.zeros((V,), dtype=xp.float32)
         # Adagrad accumulators
-        self.mWxh = np.zeros_like(self.Wxh)
-        self.mWhh = np.zeros_like(self.Whh)
-        self.mWhy = np.zeros_like(self.Why)
-        self.mbh  = np.zeros_like(self.bh)
-        self.mby  = np.zeros_like(self.by)
+        self.mWxh = xp.zeros_like(self.Wxh)
+        self.mWhh = xp.zeros_like(self.Whh)
+        self.mWhy = xp.zeros_like(self.Why)
+        self.mbh  = xp.zeros_like(self.bh)
+        self.mby  = xp.zeros_like(self.by)
 
     @staticmethod
-    def softmax(z: np.ndarray) -> np.ndarray:
-        z = z - np.max(z)
-        e = np.exp(z)
-        s = e / np.sum(e)
-        return s
+    def softmax(z):
+        z = z - z.max()
+        e = xp.exp(z)
+        return e / e.sum()
 
-    def onehot(self, idx: int) -> np.ndarray:
-        v = np.zeros((self.V,), dtype=np.float64)
-        v[idx] = 1.0
-        return v
-
-    def bptt(self, inputs: List[int], targets: List[int], hprev: np.ndarray):
+    def bptt(self, inputs: List[int], targets: List[int], hprev):
         """
         Forward + backward through a sequence chunk.
         Returns: loss, grads dict, last hidden state
         """
-        H, V = self.H, self.V
-        xs, hs, ys, ps = [], [], [], []
-        hs_prev = hprev.copy()
-
+        H = self.H
+        hs = []
+        ps = []
         loss = 0.0
-        # forward
-        for t in range(len(inputs)):
-            x_t = self.onehot(inputs[t])
-            xs.append(x_t)
-            a = self.Wxh @ x_t + self.Whh @ hs_prev + self.bh
-            h_t = np.tanh(a)
-            hs.append(h_t)
+        hs_prev = hprev
+
+        # Forward (no one-hot: take Wxh[:, idx])
+        for idx_in, idx_tgt in zip(inputs, targets):
+            a = self.Wxh[:, idx_in] + self.Whh @ hs_prev + self.bh
+            h_t = xp.tanh(a)
             y_t = self.Why @ h_t + self.by
-            ys.append(y_t)
             p_t = self.softmax(y_t)
+            loss -= float(xp.log(xp.maximum(p_t[idx_tgt], 1e-12)))
+            hs.append(h_t)
             ps.append(p_t)
-            # cross-entropy
-            loss -= math.log(max(p_t[targets[t]], 1e-12))
             hs_prev = h_t
 
-        # grads init
-        dWxh = np.zeros_like(self.Wxh)
-        dWhh = np.zeros_like(self.Whh)
-        dWhy = np.zeros_like(self.Why)
-        dbh  = np.zeros_like(self.bh)
-        dby  = np.zeros_like(self.by)
+        # Grads init
+        dWxh = xp.zeros_like(self.Wxh)
+        dWhh = xp.zeros_like(self.Whh)
+        dWhy = xp.zeros_like(self.Why)
+        dbh  = xp.zeros_like(self.bh)
+        dby  = xp.zeros_like(self.by)
+        dh_next = xp.zeros((H,), dtype=xp.float32)
 
-        dh_next = np.zeros((H,), dtype=np.float64)
-
-        # backward
-        for t in reversed(range(len(inputs))):
+        # Backward
+        for t in range(len(inputs)-1, -1, -1):
             dy = ps[t].copy()
             dy[targets[t]] -= 1.0  # ∂L/∂y
-            dWhy += np.outer(dy, hs[t])
+            dWhy += xp.outer(dy, hs[t])
             dby  += dy
 
             dh = self.Why.T @ dy + dh_next
             dhraw = (1.0 - hs[t] * hs[t]) * dh  # tanh'
             dbh  += dhraw
-            dWxh += np.outer(dhraw, xs[t])
+            # Column update instead of outer with one-hot
+            dWxh[:, inputs[t]] += dhraw
+
             h_prev_t = hs[t-1] if t > 0 else hprev
-            dWhh += np.outer(dhraw, h_prev_t)
+            dWhh += xp.outer(dhraw, h_prev_t)
 
             dh_next = self.Whh.T @ dhraw
 
         # clip
         clip = 5.0
         for G in (dWxh, dWhh, dWhy):
-            np.clip(G, -clip, clip, out=G)
-        np.clip(dbh, -clip, clip, out=dbh)
-        np.clip(dby, -clip, clip, out=dby)
+            xp.clip(G, -clip, clip, out=G)
+        xp.clip(dbh, -clip, clip, out=dbh)
+        xp.clip(dby, -clip, clip, out=dby)
 
         return loss, {"dWxh": dWxh, "dWhh": dWhh, "dWhy": dWhy, "dbh": dbh, "dby": dby}, hs[-1].copy()
 
@@ -152,12 +186,11 @@ class TinyRNN:
         self.mbh  += grads["dbh"]  ** 2
         self.mby  += grads["dby"]  ** 2
 
-        self.Wxh -= lr * grads["dWxh"] / (np.sqrt(self.mWxh) + eps)
-        self.Whh -= lr * grads["dWhh"] / (np.sqrt(self.mWhh) + eps)
-        self.Why -= lr * grads["dWhy"] / (np.sqrt(self.mWhy) + eps)
-        self.bh  -= lr * grads["dbh"]  / (np.sqrt(self.mbh)  + eps)
-        self.by  -= lr * grads["dby"]  / (np.sqrt(self.mby)  + eps)
-
+        self.Wxh -= lr * grads["dWxh"] / (xp.sqrt(self.mWxh) + eps)
+        self.Whh -= lr * grads["dWhh"] / (xp.sqrt(self.mWhh) + eps)
+        self.Why -= lr * grads["dWhy"] / (xp.sqrt(self.mWhy) + eps)
+        self.bh  -= lr * grads["dbh"]  / (xp.sqrt(self.mbh)  + eps)
+        self.by  -= lr * grads["dby"]  / (xp.sqrt(self.mby)  + eps)
 
 # --------------- Training loop (streaming) ---------------
 def train_stream(dataset_file: str, H: int, SEQ: int, EPOCHS: int, LR: float):
@@ -171,17 +204,36 @@ def train_stream(dataset_file: str, H: int, SEQ: int, EPOCHS: int, LR: float):
     tokens = build_tokens(text)
     vocab, ivocab = build_vocab(tokens)
     V = len(vocab)
-    ids = np.array([vocab[t] for t in tokens], dtype=np.int32)
+    ids = _np.array([vocab[t] for t in tokens], dtype=_np.int32)  # CPU indices
 
     steps_per_epoch = int(max(0, len(ids) - SEQ) // max(1, SEQ))
     total_steps = max(1, steps_per_epoch * EPOCHS)
     done_steps = 0
 
+    backend = "GPU (CuPy/CUDA 13.x)" if _GPU_AVAILABLE else "CPU (NumPy)"
+    if not _GPU_AVAILABLE and GPU_INIT_ERROR:
+        yield GPU_INIT_ERROR + "\n"
+    yield f"Backend: {backend}\n"
+    if _GPU_AVAILABLE:
+        try:
+            import cupy as cp
+            from cupy.cuda import Device, runtime
+            dev = Device(0)
+            name = getattr(dev, "name", None) or getattr(dev, "attributes", {}).get("Name")
+            cudart = None
+            try:
+                cudart = runtime.runtimeGetVersion()
+            except Exception:
+                pass
+            yield f"GPU: {name or 'Unknown'} | CUDA runtime: {cudart or 'n/a'}\n"
+        except Exception:
+            pass
+
     yield f"Dataset: {dataset_file}\nTokens: {len(tokens)}\nVocab: {V}\nH: {H}  SEQ: {SEQ}  Epochs: {EPOCHS}  LR: {LR}\n"
     yield f"Planned steps: {total_steps} (≈ {steps_per_epoch} / epoch)\n\n"
 
     rnn = TinyRNN(V=V, H=H, scale=0.05, seed=123)
-    hprev = np.zeros((H,), dtype=np.float64)
+    hprev = xp.zeros((H,), dtype=xp.float32)
 
     for epoch in range(1, EPOCHS + 1):
         loss_sum = 0.0
@@ -217,11 +269,11 @@ def train_stream(dataset_file: str, H: int, SEQ: int, EPOCHS: int, LR: float):
         "V": V, "H": H,
         "vocab": vocab,          # token -> id
         "ivocab": ivocab,        # id -> token
-        "Wxh": rnn.Wxh.tolist(),
-        "Whh": rnn.Whh.tolist(),
-        "Why": rnn.Why.tolist(),
-        "bh":  rnn.bh.tolist(),
-        "by":  rnn.by.tolist(),
+        "Wxh": to_cpu(rnn.Wxh).tolist(),
+        "Whh": to_cpu(rnn.Whh).tolist(),
+        "Why": to_cpu(rnn.Why).tolist(),
+        "bh":  to_cpu(rnn.bh ).tolist(),
+        "by":  to_cpu(rnn.by ).tolist(),
         "meta": {
             "dataset": dataset_file,
             "epochs": EPOCHS,
@@ -229,7 +281,9 @@ def train_stream(dataset_file: str, H: int, SEQ: int, EPOCHS: int, LR: float):
             "lr": LR,
             "time": datetime.utcnow().isoformat() + "Z",
             "train_seconds": round(time.time() - t0, 3),
-            "tokens": len(tokens)
+            "tokens": len(tokens),
+            "backend": backend,
+            "dtype": "float32"
         }
     }
     (MODELS_DIR / fname).write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
@@ -355,6 +409,7 @@ document.getElementById('run').onclick = run;
 app = Flask(__name__)
 
 def list_datasets() -> List[str]:
+    # показываем только .txt (удобнее переименовать файлы на *.txt)
     return sorted([f.name for f in DATASETS_DIR.glob("*.txt")])
 
 def list_models():
@@ -372,9 +427,9 @@ def index():
 @app.route("/run")
 def run():
     dataset = request.args.get("dataset", "greetings_ru_en.txt")
-    H      = max(8, int(request.args.get("hidden", 64)))
-    SEQ    = max(4, int(request.args.get("seq", 16)))
-    EPOCHS = max(1, int(request.args.get("epochs", 5)))
+    H      = max(8, int(request.args.get("hidden", 256)))
+    SEQ    = max(4, int(request.args.get("seq", 32)))
+    EPOCHS = max(1, int(request.args.get("epochs", 80)))
     LR     = max(0.0001, float(request.args.get("lr", 0.05)))
 
     @stream_with_context
